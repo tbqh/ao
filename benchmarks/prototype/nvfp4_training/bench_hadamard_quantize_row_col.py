@@ -6,7 +6,7 @@
 
 import itertools
 from dataclasses import dataclass
-from typing import List
+from typing import List, Optional
 
 import torch
 from tabulate import tabulate
@@ -17,6 +17,13 @@ from torchao.prototype.mx_formats.hadamard_amax_triton import triton_rht_amax
 from torchao.prototype.mx_formats.hadamard_quantize_row_col_triton import (
     triton_rht_quantize_row_col,
 )
+
+# Soft dependency on TransformerEngine
+try:
+    from transformer_engine.pytorch.tensor import NVFP4Quantizer
+    HAS_TE = True
+except ImportError:
+    HAS_TE = False
 
 device = torch.device("cuda")
 
@@ -32,8 +39,10 @@ class ExperimentConfig:
 
 @dataclass(frozen=True)
 class ExperimentResult:
-    time_us: float
-    gbps: float
+    triton_time_us: float
+    triton_gbps: float
+    te_time_us: Optional[float] = None
+    te_gbps: Optional[float] = None
 
 
 @dataclass(frozen=True)
@@ -52,14 +61,14 @@ def run_experiment(config: ExperimentConfig) -> ExperimentResult | None:
     m, n = config.m, config.n
     x = torch.randn(m, n, dtype=torch.bfloat16, device=device)
 
-    try:
+    # Triton benchmark (amax + quantize together for fair comparison with TE)
+    def triton_full_quantize(x):
         col_amax, row_amax = triton_rht_amax(x)
-        time_us = benchmark_cuda_function_in_microseconds(
-            triton_rht_quantize_row_col,
-            x,
-            col_global_amax=col_amax,
-            row_global_amax=row_amax,
-        )
+        return triton_rht_quantize_row_col(x, col_global_amax=col_amax, row_global_amax=row_amax)
+
+    try:
+        triton_full_quantize(x)  # Warmup / check if implemented
+        triton_time_us = benchmark_cuda_function_in_microseconds(triton_full_quantize, x)
     except NotImplementedError:
         return None
 
@@ -67,22 +76,55 @@ def run_experiment(config: ExperimentConfig) -> ExperimentResult | None:
     col_write = n * (m // 2) + (n // 128) * (m // 64) * 32 * 16
     row_write = m * (n // 2) + (m // 128) * (n // 64) * 32 * 16
     total_bytes = read_bytes + col_write + row_write
-    gbps = (total_bytes / 1e9) / (time_us / 1e6)
+    triton_gbps = (total_bytes / 1e9) / (triton_time_us / 1e6)
 
-    return ExperimentResult(time_us=time_us, gbps=gbps)
+    # TE benchmark (if available)
+    te_time_us = None
+    te_gbps = None
+    if HAS_TE:
+        te_quantizer = NVFP4Quantizer(
+            rowwise=True,
+            columnwise=False,
+            with_rht=True,
+            with_post_rht_amax=True,
+        )
+        te_time_us = benchmark_cuda_function_in_microseconds(te_quantizer, x)
+        te_gbps = (total_bytes / 1e9) / (te_time_us / 1e6)
+
+    return ExperimentResult(
+        triton_time_us=triton_time_us,
+        triton_gbps=triton_gbps,
+        te_time_us=te_time_us,
+        te_gbps=te_gbps,
+    )
 
 
 def print_results(experiments: List[Experiment]):
-    headers = ["M", "N", "time_us", "gbps"]
-    rows = [
-        [
-            e.config.m,
-            e.config.n,
-            round(e.result.time_us, 3),
-            round(e.result.gbps, 3),
+    if HAS_TE:
+        headers = ["M", "N", "Triton us", "Triton GB/s", "TE us", "TE GB/s", "Speedup"]
+        rows = [
+            [
+                e.config.m,
+                e.config.n,
+                round(e.result.triton_time_us, 3),
+                round(e.result.triton_gbps, 3),
+                round(e.result.te_time_us, 3) if e.result.te_time_us else "N/A",
+                round(e.result.te_gbps, 3) if e.result.te_gbps else "N/A",
+                f"{e.result.te_time_us / e.result.triton_time_us:.2f}x" if e.result.te_time_us else "N/A",
+            ]
+            for e in experiments
         ]
-        for e in experiments
-    ]
+    else:
+        headers = ["M", "N", "Triton us", "Triton GB/s"]
+        rows = [
+            [
+                e.config.m,
+                e.config.n,
+                round(e.result.triton_time_us, 3),
+                round(e.result.triton_gbps, 3),
+            ]
+            for e in experiments
+        ]
     print(tabulate(rows, headers=headers))
 
 
