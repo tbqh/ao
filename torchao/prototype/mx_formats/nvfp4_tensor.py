@@ -37,6 +37,7 @@ from torchao.quantization.quantize_.common import (
 from torchao.utils import TorchAOBaseTensor, fill_defaults
 
 E4M3_EPS = torch.finfo(torch.float8_e4m3fn).tiny
+AMAX_EPS = 1e-12  # Floor for amax to avoid div-by-zero (matches FP8)
 
 aten = torch.ops.aten
 
@@ -763,7 +764,8 @@ def per_tensor_amax_to_scale(amax: torch.Tensor) -> torch.Tensor:
     Returns:
         torch.Tensor: Per-tensor scale for two-level NVFP4 scaling
     """
-    return amax.to(torch.float32) / (F8E4M3_MAX * F4_E2M1_MAX)
+    amax_clamped = torch.clamp(amax.to(torch.float32), min=AMAX_EPS)
+    return amax_clamped / (F8E4M3_MAX * F4_E2M1_MAX)
 
 
 def nvfp4_quantize(
